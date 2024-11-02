@@ -26,9 +26,9 @@ train_params:
   task_name: 'voc'
   seed: 1111
   acc_steps: 1
-  num_epochs: 2
-  batch_size: 10
-  lr_steps: [1]
+  num_epochs: 100
+  batch_size: 16
+  lr_steps: [25, 50, 75]
   lr: 0.001
   log_steps : 100
   infer_conf_threshold : 0.5

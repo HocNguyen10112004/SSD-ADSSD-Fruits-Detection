@@ -111,7 +111,7 @@ class VOCDataset(Dataset):
         classes = ['Apple', 'Banana', 'Grape', 'Orange', 'Pineapple', 'Watermelon']
         # classes = sorted(classes)
         # We need to add background class as well with 0 index
-        classes = classes + ['background']
+        classes = ['background'] + classes 
 
         self.label2idx = {classes[idx]: idx for idx in range(len(classes))}
         self.idx2label = {idx: classes[idx] for idx in range(len(classes))}
