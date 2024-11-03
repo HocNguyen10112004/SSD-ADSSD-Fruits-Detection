@@ -197,32 +197,64 @@ def generate_default_boxes(feat, aspect_ratios, scales):
         )
         dboxes.append(dboxes_in_image.to(feat[0].device))
     return dboxes
+#RCBAM
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
 
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
 
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class RCBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(RCBAM, self).__init__()
+        self.channel_attention = ChannelAttention(in_planes, ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = x * self.channel_attention(x)
+        x = x * self.spatial_attention(x)
+        return x
+#MDCM
+class MDCM(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(MDCM, self).__init__()
+        self.branch1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, dilation=1, padding=1)
+        self.branch2 = nn.Conv2d(in_channels, out_channels, kernel_size=3, dilation=2, padding=2)
+        self.branch3 = nn.Conv2d(in_channels, out_channels, kernel_size=3, dilation=3, padding=3)
+
+    def forward(self, x):
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        x3 = self.branch3(x)
+        return x1 + x2 + x3
+
+#SSD
 class SSD(nn.Module):
-    r"""
-    Main Class for SSD. Does the following steps
-    to generate detections/losses.
-    During initialization
-    1. Load VGG Imagenet pretrained model
-    2. Extract Backbone from VGG and add extra conv layers
-    3. Add class prediction and bbox transformation prediction layers
-    4. Initialize all conv2d layers
-
-    During Forward Pass
-    1. Get conv4_3 output
-    2. Normalize and scale conv4_3 output (feat_output_1)
-    3. Pass the unscaled conv4_3 to conv5_3 layers and conv layers
-        replacing fc6 and fc7 of vgg (feat_output_2)
-    4. Pass the conv_fc7 output to extra conv layers (feat_output_3-6)
-    5. Get the classification and regression predictions for all 6 feature maps
-    6. Generate default_boxes for all these feature maps(8732 x 4)
-    7a. If in training assign targets for these default_boxes and
-        compute localization and classification losses
-    7b. If in inference mode, then do all pre-nms filtering, nms
-        and then post nms filtering and return the detected boxes,
-        their labels and their scores
-    """
     def __init__(self, config, num_classes=7):
         super().__init__()
         self.aspect_ratios = config['aspect_ratios']
@@ -237,7 +269,6 @@ class SSD(nn.Module):
         self.pre_nms_topK = config['pre_nms_topK']
         self.nms_threshold = config['nms_threshold']
         self.detections_per_img = config['detections_per_img']
-
         # Load imagenet pretrained vgg network
         backbone = torchvision.models.vgg16(
             weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1
@@ -246,22 +277,21 @@ class SSD(nn.Module):
         # Get all max pool indexes to determine different stages
         max_pool_pos = [idx for idx, layer in enumerate(list(backbone.features))
                         if isinstance(layer, nn.MaxPool2d)]
+        max_pool_stage_2_pos = max_pool_pos[-4]
         max_pool_stage_3_pos = max_pool_pos[-3]  # for vgg16 this would be 16
         max_pool_stage_4_pos = max_pool_pos[-2]  # for vgg16 this would be 23
 
-        backbone.features[max_pool_stage_3_pos].ceil_mode = True
+        backbone.features[max_pool_stage_2_pos].ceil_mode = True
         # otherwise vgg conv4_3 output will be 37x37
-        self.features = nn.Sequential(*backbone.features[:max_pool_stage_4_pos])
+        self.features = nn.Sequential(
+            *backbone.features[:max_pool_stage_3_pos],
+            MDCM(256,256),
+            RCBAM(256),
+            *backbone.features[max_pool_stage_3_pos:max_pool_stage_4_pos],
+            
+        )
         self.scale_weight = nn.Parameter(torch.ones(512) * 20)
 
-        ###################################
-        # Conv5_3 + Conv for fc6 and fc 7 #
-        ###################################
-        # Conv modules replacing fc6 and fc7
-        # Ideally we would copy the weights
-        # but here we are just adding new layers
-        # and not copying fc6 and fc7 weights by
-        # subsampling
         fcs = nn.Sequential(
             nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
             nn.Conv2d(in_channels=512, out_channels=1024, kernel_size=3,
@@ -271,6 +301,7 @@ class SSD(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.conv5_3_fc = nn.Sequential(
+            
             *backbone.features[max_pool_stage_4_pos:-1],
             fcs,
         )
